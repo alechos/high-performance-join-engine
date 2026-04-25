@@ -1,287 +1,150 @@
-[![Review Assignment Due Date](https://classroom.github.com/assets/deadline-readme-button-22041afd0340ce965d47ae6ef1cefeee28c7c493a6346c4f15d667ab976d596c.svg)](https://classroom.github.com/a/gjaw_qSU)
-# SIGMOD Contest 2025
+# High-Performance In-Memory Join Engine
 
-## Task
+[![Build and Test](https://github.com/alechos/high-performance-join-engine/actions/workflows/build.yml/badge.svg)](https://github.com/alechos/high-performance-join-engine/actions)
 
-Given the joining pipeline and the pre-filtered input data, your task is to implement an efficient joining algorithm to accelerate the execution time of the joining pipeline. Specifically, you need to implement the following function in `src/execute.cpp`:
+Built for the [SIGMOD 2025 Programming Contest](https://sigmod2025.github.io/), an international database systems competition. The task was to implement and optimize an in-memory hash join execution pipeline over columnar data. Execution time was reduced from **340,000 ms to 15,000 ms , a 16× speedup** through iterative pipeline redesign, custom hash table implementations, and parallelization.
 
-```C++
-ColumnarTable execute(const Plan& plan, void* context);
-```
+## Overview
 
-Optionally, you can implement these two functions as well to prepare any global context (e.g., thread pool) to accelerate the execution.
+The engine executes multi-way hash join pipelines over in-memory columnar tables. Given a query plan (a tree of scan and hash join nodes) and pre-filtered input data derived from the [JOB benchmark](https://github.com/gregrahn/join-order-benchmark) over the IMDB dataset, it produces correct joined output as efficiently as possible.
 
-```C++
-void* build_context();
-void destroy_context(void*);
-```
+The project was developed in three phases, each targeting a different bottleneck:
 
-### Input format
+**Phase 1** focused on replacing `std::unordered_map` with custom hash table implementations to reduce collision overhead and improve probe efficiency.
 
-The input plan in the above function is defined as the following struct.
+**Phase 2** redesigned the execution pipeline itself — introducing late materialization, column-store intermediate results, and a join-specific unchained hash structure.
 
-```C++
-struct ScanNode {
-    size_t base_table_id;
-};
+**Phase 3** parallelized the build and probe phases using a partitioned strategy and introduced a slab-based memory allocator to reduce allocation overhead.
 
-struct JoinNode {
-    bool   build_left;
-    size_t left;
-    size_t right;
-    size_t left_attr;
-    size_t right_attr;
-};
+## System Architecture
 
-struct PlanNode {
-    std::variant<ScanNode, JoinNode>          data;
-    std::vector<std::tuple<size_t, DataType>> output_attrs;
-};
+Input tables are stored in a paged columnar format. Intermediate results are represented as vectors of `column_t` columns containing compact `value_t` values (either integers or string references), enabling late materialization by deferring expensive string reconstruction until the final output stage.
 
-struct Plan {
-    std::vector<PlanNode>      nodes;
-    std::vector<ColumnarTable> inputs;
-    size_t root;
-}
-```
+Joins follow a build–probe model. The final design uses a directory-based unchained structure with contiguous tuple storage, improving cache locality during probing. Parallel execution is achieved through partitioned build phases, work-stealing probe phases over row chunks, and deterministic merging of per-thread outputs before producing the final columnar result.
 
-**Scan**:
-- The `base_table_id` member refers to which input table in the `inputs` member of a plan is used by the Scan node.
-- Each item in the `output_attrs` indicates which column in the base table should be output and what type it is.
+Tested on: Intel Core i7, 16GB RAM, Ubuntu 24.04, Clang 18.
 
-**Join**:
-- The `build_left` member refers to which side the hash table should be built on, where `true` indicates building the hash table on the left child, and `false` indicates the opposite.
-- The `left` and `right` members are the indexes of the left and right child of the Join node in the `nodes` member of a plan, respectively.
-- The `left_attr` and `right_attr` members are the join condition of Join node. Supposing that there are two records, `left_record` and `right_record`, from the intermediate results of the left and right child, respectively. The members indicate that the two records should be joined when `left_record[left_attr] == right_record[right_attr]`.
-- Each item in the `output_attrs` indicates which column in the result of children should be output and what type it is. Supposing that the left child has $n_l$ columns and the right child has $n_r$ columns, the value of the index $i \in \{0, \dots, n_l + n_r - 1\}$, where the ranges $\{0, \dots, n_l - 1\}$ and $\{n_l, \dots, n_l + n_r - 1\}$ indicate the output column is from left and right child respectively.
+## Hash Table Implementations
 
-**Root**: The `root` member of a plan indicates which node is the root node of the execution plan tree.
+Four hash table implementations were built and benchmarked as drop-in replacements for `std::unordered_map`.
 
-### Data format
+**Robin Hood Hashing** uses open addressing with linear probing and probe-sequence-length (PSL) balancing. A Murmur3-style finalizer is applied on top of `std::hash` to improve key distribution, reducing maximum probe sequence lengths by up to 95% in testing. Load factor: 0.9.
 
-The input and output data both follow a simple columnar data format.
+**Cuckoo Hashing** maintains two separate tables with two independent hash functions, guaranteeing constant-time lookups by checking at most two positions. Displacement chains are bounded to avoid cycles; the table doubles on rehash. Load factor: 0.5.
 
-```C++
-enum class DataType {
-    INT32,       // 4-byte integer
-    INT64,       // 8-byte integer
-    FP64,        // 8-byte floating point
-    VARCHAR,     // string of arbitary length
-};
+**Hopscotch Hashing** uses a 32-bit neighborhood bitmap per bucket for fast bitwise filtering and cache-friendly access within a fixed-size window (H=32). Load factor: 0.9.
 
-constexpr size_t PAGE_SIZE = 8192;
+**Unchained Hashing** is a directory-based structure designed specifically for join processing. Tuples are stored in a contiguous adjacency array grouped by hash prefix using counting sort and prefix sums, maximizing cache locality during probing. Each directory entry embeds a lightweight 16-bit Bloom filter packed into a single 64-bit word alongside the range pointer, enabling fast rejection of non-matching probe keys. Fibonacci hashing was selected over CRC32 after benchmarking (CRC32: 275k ms vs Fibonacci: 240k ms).
 
-struct alignas(8) Page {
-    std::byte data[PAGE_SIZE];
-};
+## Optimizations
 
-struct Column {
-    DataType           type;
-    std::vector<Page*> pages;
-};
+### Late Materialization and String Handling
 
-struct ColumnarTable {
-    size_t              num_rows;
-    std::vector<Column> columns;
-};
-```
+Rather than eagerly copying all columns through the join pipeline, intermediate results propagate row identifiers and only materialize result columns at the final output stage. This is especially beneficial for VARCHAR attributes, which are expensive to copy and typically only appear in final output.
 
-A `ColumnarTable` first stores how many rows the table has in the `num_rows` member, then stores each column seperately as a `Column`. Each `Column` has a type and stores the items of the column into several pages. Each page is of 8192 bytes. In each page:
+To support this, a compact 64-bit string reference (`StrRef`) was introduced that stores the table, column, page, and offset of the original string without copying bytes. The runtime value type (`value_t`) encodes INT32, StrRef, or NULL using tag bits, eliminating heavier variant-based representations and significantly reducing intermediate memory footprint.
 
-- The first 2 bytes are a `uint16_t` which is the number of rows $n_r$ in the page.
-- The following 2 bytes are a `uint16_t` which is the number of non-`NULL` values $n_v$ in the page.
-- The first $n_r$ bits in the last $\left\lfloor\frac{(n_r + 7)}{8}\right\rfloor$ bytes is a bitmap indicating whether the corresponding row has value or is `NULL`.
+### Column-Store Intermediate Results
 
-**Fixed-length attribute**: There are $n_v$ contiguous values begins at the first aligned position. For example, in a `Page` of `INT32`, the first value is at `data + 4`. While in a `Page` of `INT64` and `FP64`, the first value is at `data + 8`.
+Intermediate results were redesigned from row-oriented to column-oriented layout. Since join processing primarily accesses specific columns, storing intermediates as columns of `value_t` pages improves spatial locality and reduces cache misses. For dense INT32 input columns without NULLs, a direct access mode was added that bypasses intermediate copying entirely.
 
-**Variable-length attribute**: There are $n_v$ contigous offsets (`uint16_t`) begins at `data + 4` in a `Page`, followed by the content of the varchars which begins at `char_begin = data + 4 + n_r * 2`. Each offset indicates the ending offset of the corresponding `VARCHAR` with respect to the `char_begin`.
+### Parallel Execution
 
-**Long string**: When the length of a string is longer than `PAGE_SIZE - 7`, it can not fit in a normal page. Special pages will be used to store such string. If $n_r$ `== 0xffff` or $n_r$ `== 0xfffe`, the `Page` is a special page for long string. `0xffff` means the page is the first page of a long string and `0xfffe` means the page is the following page of a long string. The following 2 bytes is a `uint16_t` indicating the number of chars in the page, beginning at `data + 4`.
+The build phase uses a partitioned hash join strategy: threads independently distribute tuples into thread-local partition buffers, a prefix sum determines final memory ranges, and tuples are copied into contiguous storage in parallel. The probe phase is fully parallel with no synchronization required since partitions are disjoint and build-side storage is read-only.
 
-## Requirement
+Threads synchronize only at well-defined phase boundaries, keeping overhead low.
 
-- You can only modify the file `src/execute.cpp` in the project.
-- You must not use any third-party libraries. If you are using libraries for development (e.g., for logging), ensure to remove them before the final submission.
-- The joining pipeline (including order and build side) is optimized by PostgreSQL for `Hash Join` only. However, in the `execute` function, you are free to use other algorithms and change the pipeline, as long as the result is equivalent.
-- For any struct listed above, all of there members are public. You can manipulate them in free functions as desired as long as the original files are not changed and the manipulated objects can be destructed properly.
-- Your program will be evaluated on an unpublished benchmark sampled from the original JOB benchmark. You will not be able to access the test benchmark.
+| Threads | Execution Time (ms) |
+|---------|-------------------|
+| 2       | 25,000            |
+| 4       | 17,000            |
+| **8**   | **15,000**        |
 
-## Quick start
+### Slab-Based Memory Allocation
 
-> [!TIP]
-> Run all the following commands in the root directory of this project.
+A three-level slab allocator was implemented to avoid contention on the global allocator during parallel tuple collection. The first level acquires large chunks from the system, the second subdivides them into blocks, and the third allocates individual tuples from partition-local bump allocators. Memory is released in bulk after the build phase, eliminating fine-grained deallocation overhead entirely.
 
-First, download the imdb dataset.
+## Performance
+
+**Phase 1 - Hash table comparison (row-store pipeline):**
+
+| Implementation     | Time (ms) |
+|--------------------|-----------|
+| std::unordered_map | 340,000   |
+| Robin Hood         | 333,000   |
+| Hopscotch          | 338,000   |
+| Cuckoo             | 330,000   |
+| Unchained          | 240,000   |
+
+**Phase 2 - After late materialization and column-store intermediates:**
+
+| Implementation     | Time (ms) |
+|--------------------|-----------|
+| std::unordered_map | 60,000    |
+| Robin Hood         | 54,000    |
+| Hopscotch          | 50,000    |
+| Cuckoo             | 58,000    |
+| Unchained          | 37,000    |
+
+**Phase 3 - Final (unchained + slab allocator + 8-thread parallelization):**
+
+| Implementation     | Time (ms) |
+|--------------------|-----------|
+| Final              | 15,000    |
+
+The key takeaway from the progression is that redesigning the execution model and memory layout had a far greater impact than swapping hash table variants. The jump from 240k to 37k ms came entirely from late materialization and column-store intermediates, not from the hash table itself.
+
+## Build Instructions
+
+Requires Linux and Clang 18.
 
 ```bash
+# Download the IMDB dataset
 ./download_imdb.sh
-```
 
-Second, build the project.
-
-```bash
+# Build
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -Wno-dev
 cmake --build build -- -j $(nproc)
-```
 
-Third, prepare the DuckDB database for correctness checking.
-
-```bash
+# Build DuckDB database for correctness checking
 ./build/build_database imdb.db
-```
 
-Now, you can run the tests:
-```bash
+# Run with correctness checking
 ./build/run plans.json
-```
-> [!TIP]
-> If you want to use `Ninja Multi-Config` as the generator. The commands will look like:
-> 
->```bash
-> cmake -S . -B build -Wno-dev -G "Ninja Multi-Config"
-> cmake --build build --config Release -- -j $(nproc)
-> ./build/Release/build_database imdb.db
-> ./build/Release/run plans.json
-> ```
 
-# Cache
-## This section is only for UNIX users
-There are 2 new executables with this repository. They cache the join tables and
-result of each query and mmap them for faster loading times and getting rid of duckdb.
-
-To build the cache you need to run:
-```bash
+# Build cache for faster repeated runs (Linux x86_64)
 ./build/build_cache plans.json
-```
 
-> [!TIP] 
-> If you are using `Linux x86_64` you can download our prebuilt cache with:
-> ```
-> wget http://share.uoa.gr/protected/all-download/sigmod25/sigmod25_cache_x86.tar.gz
-> ```
-> If you are using `macOS arm64` you can download our prebuilt cache with:
-> ```
-> wget http://share.uoa.gr/protected/all-download/sigmod25/sigmod25_cache_arm.tar.gz
-> ```
-> For all other systems you will need to build the cache on your own.
+# Or download prebuilt cache
+wget http://share.uoa.gr/protected/all-download/sigmod25/sigmod25_cache_x86.tar.gz
 
-After the cache is built you can run the queries using:
-```bash
+# Run using cache
 ./build/fast plans.json
 ```
 
-Also after you have built the cache you no longer need to build the `run` executable
-every time (which depends on duckdb and can be slow to compile). Just compile 
-the executable that uses the cache:
+### Selecting a Hash Algorithm
+
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -Wno-dev
-cmake --build build -- -j $(nproc) fast
-```
-
-Code is compiled with Clang 18.
-
-# Phase 1 — Hashing Algorithms
-
-## Contributors
-Our implementation of custom hash tables for Phase 1 was developed collaboratively:
-
-- **1115202100089 — Ελεάνα Λύτη**  
-  Implemented **Cuckoo Hashing**, as well as the **contains()** and **operator[]** methods for the Hopscotch Hashing variant.
-
-- **1115202100174 — Αλέξιος Σούλι**  
-  Implemented **Robinhood Hashing** and the **emplace()** method for Hopscotch Hashing.
-
-# Phase 2 
-
-## Contributors
-Our implementation for phase 2 was developed collaboratively:
-
-- **1115202100089 — Ελεάνα Λύτη**  
-  Focused on **Unchained Hashing**.
-
-- **1115202100174 — Αλέξιος Σούλι**  
-  Focused on **Late Materialization** and **Joins in Column Store**
-# Phase 3 
-
-## Contributors
-Our implementation for phase 3 was developed collaboratively:
-
-- **1115202100089 — Ελεάνα Λύτη**  
-  Focused on the initial setup of the Parallel Hashing and the final report.
-
-- **1115202100174 — Αλέξιος Σούλι**  
-  Focused on **Slab Allocator** and **the final optimization**
-  
-## Selecting a Hashing Algorithm
-To compile with a specific hashing algorithm other than `std::unordered_map` run:
-
-``` 
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -Wno-dev -DHASH_ALGO={algo} && 
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -Wno-dev -DHASH_ALGO={algo}
 cmake --build build --target fast
 ```
 
-Replace `{algo}` with one of the following:
+Replace `{algo}` with: `robinhood`, `cuckoo`, `hopscotch`, or `unchained` (default).
 
-- `robinhood` — Robinhood Hashing  
-- `cuckoo` — Cuckoo Hashing  
-- `hopscotch` — Hopscotch Hashing
-- `unchained` — Unchained Hashing  
+### Running Unit Tests
 
+```bash
+cmake --build build -- -j $(nproc) robinhood_tests
+cmake --build build -- -j $(nproc) cuckoo_tests
+cmake --build build -- -j $(nproc) hopscotch_tests
+cmake --build build -- -j $(nproc) unchained_tests
+cmake --build build -- -j $(nproc) slab_allocator_tests
+```
 
-## Unit Tests
+## Contributors
 
-Each hashing implementation includes its own test suite. You can build them with:
+**Ελεάνα Λύτη**
+Cuckoo hashing, unchained hash table, parallel build phase setup, final report.
 
-- `cmake --build build -- -j $(nproc) robinhood_tests`  
-- `cmake --build build -- -j $(nproc) cuckoo_tests`  
-- `cmake --build build -- -j $(nproc) hopscotch_tests`
-- `cmake --build build -- -j $(nproc) unchained_tests`
-
-## Algorithm Notes
-
-### Robinhood Hashing
-Our Robinhood Hashing implementation follows the standard probe-distance balancing strategy.
-We use `std::hash` as the base hashing function and apply a **Murmur3 finalizer** to improve distribution quality. This significantly reduced maximum probe sequence lengths—by up to 95% in our tests (PSL directly impacts lookup and insertion performance).
-Given Robinhood Hashing's ability to maintain efficient performance at high load factors (0.90+), we selected **0.9** as a practical and well-balanced target load factor.
-
-### Cuckoo Hashing
-Our Cuckoo Hashing implementation uses **two independent hash functions** to assign each key to one of two possible positions in separate tables. Both hash functions start with `std::hash` as a base and then apply **custom bit-mixing routines** (shift and XOR operations) to improve randomness and reduce collisions. This ensures that each key has two independent candidate positions, enabling **constant-time lookups** by checking at most two locations. 
-
-To maintain efficiency and prevent long displacement cycles, we selected a **maximum load factor of 0.5**. When this threshold is exceeded, the table is **rehashed and doubled in size**, guaranteeing that insertions remain fast and lookups maintain O(1) performance.
-
-### Hopscotch Hashing
-Our Hopscotch Hashing implementation uses **`std::hash` with a Murmur3-inspired finalizer** to distribute keys uniformly. Each bucket maintains a **bitmap representing a fixed-size neighborhood (`H = 32`)**, allowing keys to be moved within this neighborhood to resolve collisions efficiently. The neighborhood size makes the most of **cache locality** while remaining within the **32-bit bitmap limit**, which allows fast bitwise operations for checking and accessing occupancy. We selected a **practical load factor of 0.9**, which keeps most insertions local and ensures O(1) lookups while maintaining high cache efficiency.
-
-### Unchained Hashing
-The unchained hash table was implemented using a directory and a contiguous adjacency array to improve cache locality during hash joins.
-Both CRC32 and Fibonacci hashing were experimentally implemented.
-In the software-based implementation, CRC32 incurred substantially higher computation overhead, leading to worse overall hash join execution time.
-Consequently, Fibonacci hashing was chosen as the final hashing strategy.A lightweight 16-bit Bloom filter per directory entry is used to quickly reject non-matching keys and reduce unnecessary memory accesses.
-This design prioritizes simplicity, performance, and efficient in-memory execution.
-
-## Performance 
-
-Below are the execution times measured during benchmarking:
-
-| Hash Implementation | Time (ms) |
-|--------------------|-----------|
-| **UnorderedMap (Base)** | 340k ms   |
-| **Robinhood**      | 333k ms   |
-| **Hopscotch**      | 343k ms   |
-| **Cuckoo**         | 330k ms   |
-| **Unchained**      | 240k ms   |
-
-Below are the execution times measured after the implementation of late materilization and joins in column store:
-
-| Hash Implementation | Time (ms) |
-|--------------------|-----------|
-| **UnorderedMap (Base)** | 60k ms   |
-| **Robinhood**      | 54k ms   |
-| **Hopscotch**      | 50k ms   |
-| **Cuckoo**         | 58k ms   |
-| **Unchained**      | 37k ms   |
-
-
-| Final Implementation | Time (ms) |
-|--------------------|-----------|
-| **Unchained** | 15k ms   |
+**Αλέξιος Σούλι**
+Robin Hood hashing, Hopscotch emplace, late materialization and column-store pipeline, value_t and StrRef design, slab allocator, final optimization pass, CI/GitHub Actions setup.
