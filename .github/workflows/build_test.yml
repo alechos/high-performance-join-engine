@@ -1,29 +1,32 @@
-name: build & test
-
+name: Build and Test
 on:
   push:
   pull_request:
-
 jobs:
   build-and-test:
-    runs-on:
-      group: k23a
-
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
+      - name: Install Clang 18
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18
       - name: Configure CMake
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
             -Wno-dev
-
       - name: Build fast + tests
         run: |
           cmake --build build \
             --target fast all_tests \
             -j$(nproc)
+      - name: Run tests (CTest)
+        run: |
+          cd build
+          ctest --output-on-failure
 
       - name: Run tests (CTest)
         run: |
