@@ -1,6 +1,6 @@
 # High-Performance In-Memory Join Engine
 
-[![Build and Test](https://github.com/alechos/high-performance-join-engine/actions/workflows/build.yml/badge.svg)](https://github.com/alechos/high-performance-join-engine/actions)
+[![Build and Test](https://github.com/alechos/high-performance-join-engine/actions/workflows/build_test.yml/badge.svg)](https://github.com/alechos/high-performance-join-engine/actions)
 
 Based on the [SIGMOD 2025 Programming Contest](https://sigmod2025.github.io/) workload and dataset, an international database systems competition. The task was to implement and optimize an in-memory hash join execution pipeline over columnar data. Execution time was reduced from **340,000 ms to 15,000 ms , a 16× speedup** through iterative pipeline redesign, custom hash table implementations, and parallelization.
 
