@@ -2,7 +2,7 @@
 
 [![Build and Test](https://github.com/alechos/high-performance-join-engine/actions/workflows/build_test.yml/badge.svg)](https://github.com/alechos/high-performance-join-engine/actions)
 
-Based on the [SIGMOD 2025 Programming Contest](https://sigmod2025.github.io/) workload and dataset, an international database systems competition. The task was to implement and optimize an in-memory hash join execution pipeline over columnar data. Execution time was reduced from **340,000 ms to 15,000 ms , a 16× speedup** through iterative pipeline redesign, custom hash table implementations, and parallelization.
+Based on the [SIGMOD 2025 Programming Contest](https://sigmod-contest-2025.github.io/) workload and dataset, an international database systems competition. The task was to implement and optimize an in-memory hash join execution pipeline over columnar data. Execution time was reduced from **340,000 ms to 15,000 ms , a 16× speedup** through iterative pipeline redesign, custom hash table implementations, and parallelization.
 
 ## Overview
 
@@ -12,7 +12,7 @@ The project was developed in three phases, each targeting a different bottleneck
 
 **Phase 1** focused on replacing `std::unordered_map` with custom hash table implementations to reduce collision overhead and improve probe efficiency.
 
-**Phase 2** redesigned the execution pipeline itself — introducing late materialization, column-store intermediate results, and a join-specific unchained hash structure.
+**Phase 2** redesigned the execution pipeline itself, introducing late materialization, column-store intermediate results, and a join-specific unchained hash structure.
 
 **Phase 3** parallelized the build and probe phases using a partitioned strategy and introduced a slab-based memory allocator to reduce allocation overhead.
 
