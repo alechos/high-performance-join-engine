@@ -98,6 +98,9 @@ The key takeaway from the progression is that redesigning the execution model an
 
 Requires Linux and Clang 18.
 
+Note: Building DuckDB from source requires ~16GB of RAM. On machines with limited memory, skip the full build and use the prebuilt cache instead.
+
+### Full Build
 ```bash
 # Download the IMDB dataset
 ./download_imdb.sh
@@ -117,6 +120,27 @@ cmake --build build -- -j $(nproc)
 
 # Or download prebuilt cache
 wget http://share.uoa.gr/protected/all-download/sigmod25/sigmod25_cache_x86.tar.gz
+tar -xvf sigmod25_cache_x86.tar.gz
+
+# Run using cache
+./build/fast plans.json
+```
+
+
+### Pre-built Cache
+```bash
+# Download the IMDB dataset
+./download_imdb.sh
+
+# Build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -Wno-dev
+cmake --build build -- -j $(nproc) fast
+
+# Download prebuilt cache
+wget http://share.uoa.gr/protected/all-download/sigmod25/sigmod25_cache_x86.tar.gz
+
+# Extract cache
+tar -xvf sigmod25_cache_x86.tar.gz
 
 # Run using cache
 ./build/fast plans.json
